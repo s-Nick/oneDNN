@@ -179,7 +179,7 @@ struct ConvBiasLayer : public Layer<T> {
         dnnl::memory::dims dilates = {0, 0};
 
         const auto sycl_queue = dnnl::sycl_interop::get_queue(stream_);
-        this->out_ptr_ = sycl::malloc_shared<T>(N * oc * oh * ow, sycl_queue);
+        this->out_ptr_ = sycl::malloc_device<T>(N * oc * oh * ow, sycl_queue);
 
         //conv_src_md = dnnl::memory::desc(src_dims, data_type, format);
         conv_src_md = dnnl::memory::desc(
@@ -353,9 +353,6 @@ struct BatchNormLayer : public Layer<T> {
         dnnl::memory::dims mean_dims = {channels};
         dnnl::memory::dims var_dims = {channels};
 
-        printf("src_dims %d %d %d %d\n", batch, channels, rows, cols);
-        printf("scaleshift_dims %d \n", channels);
-
         auto bias_value = helpers::read_binary_data(bias_file);
         auto scale_value = helpers::read_binary_data(scale_file);
         auto mean_value = helpers::read_binary_data(mean_file);
@@ -369,7 +366,7 @@ struct BatchNormLayer : public Layer<T> {
 
         const auto q = dnnl::sycl_interop::get_queue(stream_);
         this->out_ptr_
-                = sycl::malloc_shared<T>(batch * channels * rows * cols, q);
+                = sycl::malloc_device<T>(batch * channels * rows * cols, q);
 
         mean_md = dnnl::memory::desc(
                 mean_dims, data_type, dnnl::memory::format_tag::x);
@@ -393,12 +390,6 @@ struct BatchNormLayer : public Layer<T> {
                         | dnnl::normalization_flags::use_shift
                         | dnnl::normalization_flags::use_global_stats);
 
-        /*
-        dnnl::normalization_flags flags {dnnl::normalization_flags::use_scale
-                | dnnl::normalization_flags::use_shift
-                | dnnl::normalization_flags::use_global_stats};
-                */
-
         bnorm_pd = dnnl::batch_normalization_forward::primitive_desc(eng_,
                 dnnl::prop_kind::forward_inference, src_md, this->out_desc_,
                 eps_, flags);
@@ -411,7 +402,6 @@ struct BatchNormLayer : public Layer<T> {
         write_to_dnnl_memory(scale_value.data(), scale_mem);
         write_to_dnnl_memory(bias_value.data(), shift_mem);
 
-        //std::cout << "zelda " << __LINE__ << ' ' << __FUNCTION__ << '\n';
     }
 
     dnnl::status execute(T *in_ptr) override {
@@ -429,14 +419,11 @@ struct BatchNormLayer : public Layer<T> {
         bnorm_args.insert({DNNL_ARG_SHIFT, shift_mem});
         bnorm_args.insert({DNNL_ARG_DST, dst_mem});
 
-        //if (_relu) bnorm_args.insert({DNNL_ARG_WORKSPACE, workspace_mem});
-
         bnorm_prim.execute(stream_, bnorm_args);
 
         stream_.wait();
 
         read_from_dnnl_memory(this->out_ptr_, dst_mem);
-        //this->out_desc_ = src_mem.get_desc();
 
         return {};
     }
@@ -531,7 +518,7 @@ struct GlobalMaxPoolLayer : public Layer<T> {
         dst_mem = dnnl::memory(this->out_desc_, eng_);
 
         auto q = dnnl::sycl_interop::get_queue(stream_);
-        this->out_ptr_ = sycl::malloc_shared<T>(batch * channels, q);
+        this->out_ptr_ = sycl::malloc_device<T>(batch * channels, q);
 
         pooling_pd = dnnl::pooling_forward::primitive_desc(eng_,
                 dnnl::prop_kind::forward_training, dnnl::algorithm::pooling_max,
@@ -627,7 +614,7 @@ struct FCLayer : public Layer<T> {
         write_to_dnnl_memory(weights.data(), weights_mem);
         write_to_dnnl_memory(bias.data(), bias_mem);
 
-        this->out_ptr_ = sycl::malloc_shared<T>(batch * out_channels, q);
+        this->out_ptr_ = sycl::malloc_device<T>(batch * out_channels, q);
 
         matmul_pd = dnnl::matmul::primitive_desc(
                 eng_, src_md, weights_md, this->out_desc_);
@@ -697,7 +684,7 @@ struct MMLayer : public Layer<T> {
         dnnl::memory::dims weights_dims = {batch, k, n};
         dnnl::memory::dims dst_dims = {batch, m, n};
 
-        this->out_ptr_ = sycl::malloc_shared<T>(batch * m * n, q);
+        this->out_ptr_ = sycl::malloc_device<T>(batch * m * n, q);
 
         src_desc = dnnl::memory::desc(
                 src_dims, data_type, dnnl::memory::format_tag::abc);
@@ -784,7 +771,7 @@ struct SumLayer : public Layer<T> {
         dst_mem = dnnl::memory(this->out_desc_, eng_);
 
         this->out_ptr_
-                = sycl::malloc_shared<T>(batch * channels * rows * cols, q);
+                = sycl::malloc_device<T>(batch * channels * rows * cols, q);
         write_to_dnnl_memory(scale_chars.data(), bias_mem);
 
         sum_pd = dnnl::binary::primitive_desc(eng_, dnnl::algorithm::binary_add,
@@ -855,7 +842,7 @@ struct SoftmaxLayer : public Layer<T> {
         this->out_desc_ = dnnl::memory::desc(src_dst_dims, data_type, format);
 
         this->out_ptr_
-                = sycl::malloc_shared<T>(batch * channels * rows * cols, q);
+                = sycl::malloc_device<T>(batch * channels * rows * cols, q);
 
         src_mem = dnnl::memory(src_md, eng_);
         dst_mem = dnnl::memory(this->out_desc_, eng_);
@@ -925,7 +912,7 @@ struct LogLayer : public Layer<T> {
         src_mem = dnnl::memory(src_md, eng_);
 
         this->out_ptr_
-                = sycl::malloc_shared<T>(batch * channels * rows * cols, q);
+                = sycl::malloc_device<T>(batch * channels * rows * cols, q);
         this->out_desc_ = dnnl::memory::desc(
                 {batch, channels, rows, cols}, data_type, format);
         dst_mem = dnnl::memory(this->out_desc_, eng_);
@@ -1005,17 +992,17 @@ struct Network {
         auto &last_layer = layers.back();
         auto &output_desc = last_layer->get_output_desc();
         auto &stream = last_layer->stream_;
+        auto q = dnnl::sycl_interop::get_queue(stream);
         auto tmp = output_desc.get_dims();
         int output_dim {1};
-        std::cout << "output tmp dims: \n";
+        //std::cout << "output tmp dims: \n";
         for (const auto &e : tmp) {
-            std::cout << e << ' ';
             output_dim *= e;
         }
-        std::cout << "\n full dim: " << output_dim << '\n';
-        std::cout << std::endl;
+        //std::cout << "\n full dim: " << output_dim << '\n';
+        //std::cout << std::endl;
         std::vector<T> output(output_dim);
-        auto q = dnnl::sycl_interop::get_queue(stream);
+        q.wait();
 
         q.memcpy(output.data(), last_layer->get_output_ptr(),
                  output_dim * sizeof(T))
@@ -1157,7 +1144,7 @@ int main(int argc, char *argv[]) {
     std::string data_dir {argv[1]};
     data_dir += "/";
 
-    DType *in_ptr = sycl::malloc_shared<DType>(32 * 1024 * 3, sycl_queue);
+    DType *in_ptr = sycl::malloc_device<DType>(32 * 1024 * 3, sycl_queue);
     auto input = helpers::read_binary_data(argv[2]);
     helpers::copy_to_device(input, in_ptr, sycl_queue);
 
@@ -1326,10 +1313,12 @@ int main(int argc, char *argv[]) {
 
     auto output = feature_transform_block.get_output_as_host_vec();
 
+    /*
     for (int i = 0; i < 32 * 10; ++i) {
         std::cout << output[i] << ' ';
     }
     std::cout << '\n';
+    */
 
     // Find index of max value in each row of output, then calculate mode of
     // results to get final classification
