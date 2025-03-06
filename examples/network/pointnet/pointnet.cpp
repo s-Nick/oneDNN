@@ -7,12 +7,10 @@
 
 #include <oneapi/dnnl/dnnl.hpp>
 #include <sycl/sycl.hpp>
-#include <unordered_map>
 
 #include "example_utils.hpp"
-#include "oneapi/dnnl/dnnl_sycl.hpp"
-#include "oneapi/dnnl/dnnl_types.h"
-//#include "oneapi/dnnl/dnnl_common.hpp"
+
+#define CHECK_PERF 0
 
 using DType = float;
 static std::array<std::string, 10> object_map = {"bathtub", "bed", "chair",
@@ -58,39 +56,6 @@ DeviceMem read_image_data(
     return DeviceMem {b, 0};
 }
 
-/*
-void dump_desc(const TensorDescriptor &desc) {
-    int n, c, h, w;
-    int s_n, s_c, s_h, s_w;
-    SNNDataType data_type;
-    getTensor4dDescriptor(
-            desc, &data_type, &n, &c, &h, &w, &s_n, &s_c, &s_h, &s_w);
-    std::cout << "\tdims: [" << n << "," << c << "," << h << "," << w << "]\n";
-}
-
-void dump_desc(const FilterDescriptor &desc) {
-    int k, c, h, w;
-    sycldnn::FilterFormat format;
-    SNNDataType data_type;
-    getFilter4dDescriptor(desc, &data_type, &format, &k, &c, &h, &w);
-    std::cout << "\tdims: [" << k << "," << c << "," << h << "," << w << "]\n";
-}
-
-void dump_desc(const ConvolutionDescriptor &desc) {
-    std::cout << "\tpad: [" << desc.getPadH() << "," << desc.getPadW() << "]\n";
-    std::cout << "\tstride: [" << desc.getStrideH() << "," << desc.getStrideW()
-              << "]\n";
-}
-
-void dump_desc(const PoolingDescriptor &desc) {
-    std::cout << "\tmode: " << static_cast<int>(desc.getMode()) << "\n";
-    std::cout << "\twindow: [" << desc.getWindowH() << "," << desc.getWindowW()
-              << "]\n";
-    std::cout << "\tpad: [" << desc.getPadH() << "," << desc.getPadW() << "]\n";
-    std::cout << "\tstride: [" << desc.getStrideH() << "," << desc.getStrideW()
-              << "]\n";
-}
-*/
 } // namespace helpers
 
 template <typename T>
@@ -109,20 +74,11 @@ struct Layer {
         sycl::free(out_ptr_, dnnl::sycl_interop::get_queue(stream_));
     }
 
-    virtual dnnl::status execute(T *in_ptr) = 0;
+    virtual void execute(T *in_ptr) = 0;
 
     T *get_output_ptr() { return out_ptr_; };
 
     dnnl::memory::desc &get_output_desc() { return out_desc_; }
-
-    /*
-    void dump_out_desc() {
-        std::cout << "Output:\n";
-        helpers::dump_desc(out_desc_);
-    }
-    */
-
-    virtual void dump_descs() = 0;
 
     dnnl::engine &engine_;
     dnnl::stream &stream_;
@@ -142,7 +98,6 @@ struct ConvBiasLayer : public Layer<T> {
             dnnl::memory::format_tag format = dnnl::memory::format_tag::nhwc,
             dnnl::memory::data_type data_type = dnnl::memory::data_type::f32)
         : Layer<T>(engine, stream), eng_(engine), stream_(stream) {
-        //auto q = handle.getQueue();
 
         dnnl::memory::dim N, ic, ih, iw, oc, kh, kw, ph_l, ph_r, pw_l, pw_r, sh,
                 sw, oh, ow;
@@ -181,28 +136,22 @@ struct ConvBiasLayer : public Layer<T> {
         const auto sycl_queue = dnnl::sycl_interop::get_queue(stream_);
         this->out_ptr_ = sycl::malloc_device<T>(N * oc * oh * ow, sycl_queue);
 
-        //conv_src_md = dnnl::memory::desc(src_dims, data_type, format);
+        // Create memory descriptors
         conv_src_md = dnnl::memory::desc(
                 src_dims, data_type, dnnl::memory::format_tag::nhwc);
         conv_weights_md = dnnl::memory::desc(
                 weights_dims, data_type, dnnl::memory::format_tag::iohw);
-
         this->out_desc_ = dnnl::memory::desc(
                 dst_dims, data_type, dnnl::memory::format_tag::nhwc);
         user_bias_md = dnnl::memory::desc(
                 bias_dims, data_type, dnnl::memory::format_tag::a);
-        //user_bias_md = dnnl::memory::desc();
 
-        //user_src_mem = dnnl::memory(conv_src_md, eng_);
+        // Create memory
         user_src_mem = dnnl::memory(
                 {src_dims, data_type, dnnl::memory::format_tag::nchw}, eng_);
-        // I have no idea which filter I should use for this one
-        //user_weights_mem = dnnl::memory(conv_weights_md, eng_);
         user_weights_mem = dnnl::memory(
                 {weights_dims, data_type, dnnl::memory::format_tag::iohw},
                 eng_);
-
-        //user_dst_mem = dnnl::memory(this->out_desc_, eng_);
         user_dst_mem = dnnl::memory(
                 {dst_dims, data_type, dnnl::memory::format_tag::nchw}, eng_);
 
@@ -211,8 +160,6 @@ struct ConvBiasLayer : public Layer<T> {
         write_to_dnnl_memory(weights.data(), user_weights_mem);
         write_to_dnnl_memory(bias_value.data(), user_bias_mem);
 
-        // Create descriptors for memory above
-
         conv_pd_ = dnnl::convolution_forward::primitive_desc(eng_,
                 dnnl::prop_kind::forward_inference,
                 dnnl::algorithm::convolution_auto, conv_src_md, conv_weights_md,
@@ -220,101 +167,29 @@ struct ConvBiasLayer : public Layer<T> {
                 padding_dims_l, padding_dims_r);
     }
 
-    dnnl::status execute(T *in_ptr) override {
-        //std::cout << "zelda " << __LINE__ << ' ' << __FUNCTION__ << '\n';
+    void execute(T *in_ptr) override {
 
         write_to_dnnl_memory(in_ptr, user_src_mem);
-        // For now, assume that the src, weights, and dst memory layouts generated
-        // by the primitive and the ones provided by the user are identical.
-        auto conv_src_mem = user_src_mem;
-        auto conv_weights_mem = user_weights_mem;
-        auto conv_dst_mem = user_dst_mem;
-
-        /*
-        // Reorder the data in case the src and weights memory layouts generated by
-        // the primitive and the ones provided by the user are different. In this
-        // case, we create additional memory objects with internal buffers that will
-        // contain the reordered data. The data in dst will be reordered after the
-        // convolution computation has finalized.
-        if (conv_pd_.src_desc() != user_src_mem.get_desc()) {
-            conv_src_mem = dnnl::memory(conv_pd_.src_desc(), eng_);
-            dnnl::reorder(user_src_mem, conv_src_mem)
-                    .execute(stream_, user_src_mem, conv_src_mem);
-        }
-
-        if (conv_pd_.weights_desc() != user_weights_mem.get_desc()) {
-            conv_weights_mem = dnnl::memory(conv_pd_.weights_desc(), eng_);
-            dnnl::reorder(user_weights_mem, conv_weights_mem)
-                    .execute(stream_, user_weights_mem, conv_weights_mem);
-        }
-
-        if (conv_pd_.dst_desc() != user_dst_mem.get_desc()) {
-            conv_dst_mem = dnnl::memory(conv_pd_.dst_desc(), eng_);
-        }
-        */
 
         // Create the primitive.
         auto conv_prim = dnnl::convolution_forward(conv_pd_);
 
         // Primitive arguments.
         std::unordered_map<int, dnnl::memory> conv_args;
-        /*
-        conv_args.insert({DNNL_ARG_SRC, conv_src_mem});
-        conv_args.insert({DNNL_ARG_WEIGHTS, conv_weights_mem});
-        conv_args.insert({DNNL_ARG_BIAS, user_bias_mem});
-        conv_args.insert({DNNL_ARG_DST, conv_dst_mem});
-        */
         conv_args.insert({DNNL_ARG_SRC, user_src_mem});
         conv_args.insert({DNNL_ARG_WEIGHTS, user_weights_mem});
         conv_args.insert({DNNL_ARG_BIAS, user_bias_mem});
         conv_args.insert({DNNL_ARG_DST, user_dst_mem});
-        //std::cout << "zelda " << __LINE__ << ' ' << __FUNCTION__ << '\n';
 
         conv_prim.execute(stream_, conv_args);
-
-        /*
-        // Reorder the data in case the dst memory descriptor generated by the
-        // primitive and the one provided by the user are different.
-        if (conv_pd_.dst_desc() != user_dst_mem.get_desc()) {
-            dnnl::reorder(conv_dst_mem, user_dst_mem)
-                    .execute(stream_, conv_dst_mem, user_dst_mem);
-        } else
-            user_dst_mem = conv_dst_mem;
-        */
 
         // Wait for the computation to finalize.
         stream_.wait();
 
-        // Read data from memory object's handle.
-        //read_from_dnnl_memory(this->out_ptr_, user_dst_mem);
         read_from_dnnl_memory(this->out_ptr_, user_dst_mem);
-        //this->out_desc_ = conv_dst_mem.get_desc();
-        //std::cout << "zelda " << __LINE__ << ' ' << __FUNCTION__ << '\n';
-
-        return {};
     }
 
-    /*
-    ~ConvBiasLayer() {
-        if (ws_ptr_) { sycl::free(ws_ptr_, this->handle_.getQueue()); }
-        sycl::free(filt_ptr_, this->handle_.getQueue());
-    }
-    */
-
-    virtual void dump_descs() override {
-        std::cout
-                << "I should dump ConvBiasLayer, but still unimplemented Line: "
-                << __LINE__ << '\n';
-        /*
-        std::cout << "Layer type: Convolution\n";
-        std::cout << "Conv:\n";
-        helpers::dump_desc(conv_desc_);
-        std::cout << "Input:\n";
-        helpers::dump_desc(in_desc_);
-        std::cout << "Filter:\n";
-        helpers::dump_desc(filt_desc_);
-        */
-    }
+    ~ConvBiasLayer() {}
 
 private:
     size_t ws_size_;
@@ -330,8 +205,6 @@ private:
     const dnnl::engine &eng_;
     dnnl::stream &stream_;
     dnnl::convolution_forward::primitive_desc conv_pd_;
-    float alpha_ = 1.0f;
-    float beta_ = 0.0f;
 };
 
 template <typename T>
@@ -348,11 +221,14 @@ struct BatchNormLayer : public Layer<T> {
         , stream_(stream)
         , _relu(add_relu) {
 
+        const auto q = dnnl::sycl_interop::get_queue(stream_);
+        // Configurin dimensions
         dnnl::memory::dims src_dims = {batch, channels, rows, cols};
         dnnl::memory::dims scaleshift_dims = {channels};
         dnnl::memory::dims mean_dims = {channels};
         dnnl::memory::dims var_dims = {channels};
 
+        // Reading input data from file
         auto bias_value = helpers::read_binary_data(bias_file);
         auto scale_value = helpers::read_binary_data(scale_file);
         auto mean_value = helpers::read_binary_data(mean_file);
@@ -364,7 +240,6 @@ struct BatchNormLayer : public Layer<T> {
         scaleshift_md = dnnl::memory::desc(
                 scaleshift_dims, data_type, dnnl::memory::format_tag::a);
 
-        const auto q = dnnl::sycl_interop::get_queue(stream_);
         this->out_ptr_
                 = sycl::malloc_device<T>(batch * channels * rows * cols, q);
 
@@ -373,6 +248,7 @@ struct BatchNormLayer : public Layer<T> {
         variance_md = dnnl::memory::desc(
                 var_dims, data_type, dnnl::memory::format_tag::x);
 
+        // Create memory
         src_mem = dnnl::memory(src_md, eng_);
         dst_mem = dnnl::memory(this->out_desc_, eng_);
         scale_mem = dnnl::memory(scaleshift_md, eng_);
@@ -394,17 +270,13 @@ struct BatchNormLayer : public Layer<T> {
                 dnnl::prop_kind::forward_inference, src_md, this->out_desc_,
                 eps_, flags);
 
-        if (_relu)
-            workspace_mem = dnnl::memory(bnorm_pd.workspace_desc(), eng_);
-
         write_to_dnnl_memory(mean_value.data(), mean_mem);
         write_to_dnnl_memory(var_value.data(), variance_mem);
         write_to_dnnl_memory(scale_value.data(), scale_mem);
         write_to_dnnl_memory(bias_value.data(), shift_mem);
-
     }
 
-    dnnl::status execute(T *in_ptr) override {
+    void execute(T *in_ptr) override {
 
         write_to_dnnl_memory(in_ptr, src_mem);
 
@@ -424,25 +296,11 @@ struct BatchNormLayer : public Layer<T> {
         stream_.wait();
 
         read_from_dnnl_memory(this->out_ptr_, dst_mem);
-
-        return {};
     }
 
     ~BatchNormLayer() {}
 
-    virtual void dump_descs() override {
-        std::cout << "Layer type: BatchNorm dump not implmented yet!\n";
-        /*
-        std::cout << "Layer type: BatchNorm\n";
-        std::cout << "Param:\n";
-        helpers::dump_desc(param_desc_);
-        std::cout << "In:\n";
-        helpers::dump_desc(this->in_desc_);
-        */
-    }
-
 private:
-    //BatchNormMode mode_;
     dnnl::engine &eng_;
     dnnl::stream &stream_;
 
@@ -461,16 +319,7 @@ private:
 
     dnnl::batch_normalization_forward::primitive_desc bnorm_pd;
 
-    /*
-    T *scale_ptr_ = nullptr;
-    T *bias_ptr_ = nullptr;
-    T *mean_ptr_ = nullptr;
-    T *var_ptr_ = nullptr;
-    */
-
     float eps_ = 1.0e-5;
-    float alpha_ = 1.0;
-    float beta_ = 0.0;
 };
 
 template <typename T>
@@ -481,8 +330,7 @@ struct GlobalMaxPoolLayer : public Layer<T> {
             dnnl::memory::data_type data_type = dnnl::memory::data_type::f32)
         : Layer<T>(engine, stream), eng_(engine), stream_(stream) {
 
-        dnnl::memory::dim N, ic, ih, iw, kh, kw, padd_l, padd_r, sh, sw, dh, dw,
-                oh, ow;
+        dnnl::memory::dim N, ic, ih, iw, kh, kw, sh, sw, dh, dw, oh, ow;
 
         N = batch;
         ic = channels;
@@ -492,8 +340,6 @@ struct GlobalMaxPoolLayer : public Layer<T> {
         kw = cols;
         sh = kh;
         sw = kw;
-        padd_l = 0;
-        padd_r = 0;
         oh = 1;
         ow = 1;
 
@@ -501,7 +347,6 @@ struct GlobalMaxPoolLayer : public Layer<T> {
         dh = 1;
         dw = 1;
 
-        //dnnl::memory::dims src_dims = {N, ic, ih, iw};
         dnnl::memory::dims src_dims = {batch, channels, rows, cols};
 
         dnnl::memory::dims dst_dims = {batch, channels, 1, 1};
@@ -521,9 +366,10 @@ struct GlobalMaxPoolLayer : public Layer<T> {
         this->out_ptr_ = sycl::malloc_device<T>(batch * channels, q);
 
         pooling_pd = dnnl::pooling_forward::primitive_desc(eng_,
-                dnnl::prop_kind::forward_training, dnnl::algorithm::pooling_max,
-                src_md, this->out_desc_, strides_dims, kernel_dims,
-                dilation_dims, padding_dims_l, padding_dims_r);
+                dnnl::prop_kind::forward_inference,
+                dnnl::algorithm::pooling_max, src_md, this->out_desc_,
+                strides_dims, kernel_dims, dilation_dims, padding_dims_l,
+                padding_dims_r);
         // Create workspace memory objects using memory descriptor created by the
         // primitive descriptor.
         // NOTE: Here, the workspace is required to save the indices where maximum
@@ -531,7 +377,7 @@ struct GlobalMaxPoolLayer : public Layer<T> {
         workspace_mem = dnnl::memory(pooling_pd.workspace_desc(), eng_);
     }
 
-    dnnl::status execute(T *in_ptr) override {
+    void execute(T *in_ptr) override {
         write_to_dnnl_memory(in_ptr, src_mem);
         auto pooling_prim = dnnl::pooling_forward(pooling_pd);
         // Primitive arguments. Set up in-place execution by assigning src as DST.
@@ -548,24 +394,10 @@ struct GlobalMaxPoolLayer : public Layer<T> {
 
         // Read data from memory object's handle.
         read_from_dnnl_memory(this->out_ptr_, dst_mem);
-
-        return {};
     }
     ~GlobalMaxPoolLayer() = default;
 
-    virtual void dump_descs() override {
-        std::cout << "Layer type: GlobalMaxPool\n";
-        /*
-        std::cout << "Pool:\n";
-        helpers::dump_desc(pool_desc_);
-        std::cout << "In:\n";
-        helpers::dump_desc(in_desc_);
-        */
-    }
-
 private:
-    //TensorDescriptor in_desc_;
-    //PoolingDescriptor pool_desc_;
     dnnl::engine &eng_;
     dnnl::stream &stream_;
     dnnl::memory src_mem;
@@ -573,9 +405,6 @@ private:
     dnnl::memory workspace_mem;
     dnnl::memory::desc src_md;
     dnnl::pooling_forward::primitive_desc pooling_pd;
-
-    float alpha_ = 1.0f;
-    float beta_ = 0.0f;
 };
 
 template <typename T>
@@ -620,7 +449,7 @@ struct FCLayer : public Layer<T> {
                 eng_, src_md, weights_md, this->out_desc_);
     }
 
-    dnnl::status execute(T *in_ptr) override {
+    void execute(T *in_ptr) override {
 
         write_to_dnnl_memory(in_ptr, src_mem);
 
@@ -642,13 +471,9 @@ struct FCLayer : public Layer<T> {
 
         // Read data from memory object's handle.
         read_from_dnnl_memory(this->out_ptr_, dst_mem);
-
-        return {};
     }
 
     ~FCLayer() {}
-
-    virtual void dump_descs() override { std::cout << "Layer type: FC\n"; }
 
 private:
     int m_, k_, n_;
@@ -663,9 +488,6 @@ private:
     dnnl::memory::desc bias_md;
 
     dnnl::matmul::primitive_desc matmul_pd;
-
-    float alpha_ = 1.0f;
-    float beta_ = 0.0f;
 };
 
 template <typename T>
@@ -701,7 +523,7 @@ struct MMLayer : public Layer<T> {
                 eng_, src_desc, weights_desc, this->out_desc_);
     }
 
-    dnnl::status execute(T *rhs_ptr) override {
+    void execute(T *rhs_ptr) override {
         write_to_dnnl_memory(rhs_ptr, weights_mem);
         write_to_dnnl_memory(lhs_ptr_, src_mem);
         auto matmul = dnnl::matmul(matmul_pd);
@@ -720,18 +542,12 @@ struct MMLayer : public Layer<T> {
 
         // Read data from memory object's handle.
         read_from_dnnl_memory(this->out_ptr_, dst_mem);
-
-        return {};
     }
 
     ~MMLayer() = default;
 
-    virtual void dump_descs() override { std::cout << "Layer type: Matmul\n"; }
-
 private:
     T *lhs_ptr_ = nullptr;
-
-    //int batch_, m_, k_, n_;
 
     dnnl::engine &eng_;
     dnnl::stream &stream_;
@@ -741,9 +557,6 @@ private:
     dnnl::memory dst_mem;
     dnnl::memory weights_mem;
     dnnl::matmul::primitive_desc matmul_pd;
-
-    float alpha_ = 1.0f;
-    float beta_ = 0.0f;
 };
 
 template <typename T>
@@ -778,7 +591,7 @@ struct SumLayer : public Layer<T> {
                 src_desc_, bias_desc_, this->out_desc_);
     }
 
-    dnnl::status execute(T *in_ptr) override {
+    void execute(T *in_ptr) override {
         write_to_dnnl_memory(in_ptr, src_mem);
 
         auto sum_prim = dnnl::binary(sum_pd);
@@ -797,20 +610,8 @@ struct SumLayer : public Layer<T> {
 
         // Read data from memory object's handle.
         read_from_dnnl_memory(this->out_ptr_, dst_mem);
-
-        return {};
     }
     ~SumLayer() = default;
-
-    virtual void dump_descs() override {
-        std::cout << "Layer type: Sum\n";
-        /*
-        std::cout << "Bias:\n";
-        helpers::dump_desc(bias_desc_);
-        std::cout << "In:\n";
-        helpers::dump_desc(this->out_desc_);
-        */
-    }
 
 private:
     dnnl::engine &eng_;
@@ -821,9 +622,6 @@ private:
     dnnl::memory dst_mem;
     dnnl::memory bias_mem;
     dnnl::binary::primitive_desc sum_pd;
-
-    float alpha_ = 1.0f;
-    float beta_ = 0.0f;
 };
 
 template <typename T>
@@ -853,7 +651,7 @@ struct SoftmaxLayer : public Layer<T> {
                 this->out_desc_, axis);
     }
 
-    dnnl::status execute(T *in_ptr) override {
+    void execute(T *in_ptr) override {
         write_to_dnnl_memory(in_ptr, src_mem);
         //
         // Create the primitive.
@@ -872,17 +670,8 @@ struct SoftmaxLayer : public Layer<T> {
 
         // Read data from memory object's handle.
         read_from_dnnl_memory(this->out_ptr_, dst_mem);
-        return {};
     }
     ~SoftmaxLayer() = default;
-
-    virtual void dump_descs() override {
-        std::cout << "Layer type: Softmax\n";
-        /*
-        std::cout << "In:\n";
-        helpers::dump_desc(in_desc_);
-        */
-    }
 
 private:
     dnnl::engine &eng_;
@@ -892,9 +681,6 @@ private:
     dnnl::memory src_mem;
     dnnl::memory dst_mem;
     dnnl::softmax_forward::primitive_desc softmax_pd;
-
-    float alpha_ = 1.0f;
-    float beta_ = 0.0f;
 };
 
 template <typename T>
@@ -922,7 +708,7 @@ struct LogLayer : public Layer<T> {
                 src_md, this->out_desc_);
     }
 
-    dnnl::status execute(T *in_ptr) override {
+    void execute(T *in_ptr) override {
         write_to_dnnl_memory(in_ptr, src_mem);
 
         auto eltwise_log = dnnl::eltwise_forward(eltwise_log_pd);
@@ -939,18 +725,8 @@ struct LogLayer : public Layer<T> {
 
         // Read data from memory object's handle.
         read_from_dnnl_memory(this->out_ptr_, dst_mem);
-
-        return {};
     }
     ~LogLayer() = default;
-
-    virtual void dump_descs() override {
-        std::cout << "Layer type: Activation\n";
-        /*
-        std::cout << "In:\n";
-        helpers::dump_desc(in_desc_);
-        */
-    }
 
 private:
     dnnl::engine &eng_;
@@ -970,12 +746,6 @@ struct Network {
     void execute(T *in_ptr) {
         for (auto &layer : layers) {
             layer->execute(in_ptr);
-#if DEBUG_LAYERS
-            layer->handle_.getQueue().wait_and_throw();
-            layer->dump_descs();
-            layer->dump_out_desc();
-            std::cout << "***\n";
-#endif
             in_ptr = layer->get_output_ptr();
         }
     }
@@ -984,9 +754,7 @@ struct Network {
         return layers.back()->get_output_desc();
     }
 
-    T *get_last_output_ptr() {
-        return layers.back()->get_output_ptr();
-    }
+    T *get_last_output_ptr() { return layers.back()->get_output_ptr(); }
 
     std::vector<T> get_output_as_host_vec() {
         auto &last_layer = layers.back();
@@ -995,14 +763,10 @@ struct Network {
         auto q = dnnl::sycl_interop::get_queue(stream);
         auto tmp = output_desc.get_dims();
         int output_dim {1};
-        //std::cout << "output tmp dims: \n";
         for (const auto &e : tmp) {
             output_dim *= e;
         }
-        //std::cout << "\n full dim: " << output_dim << '\n';
-        //std::cout << std::endl;
         std::vector<T> output(output_dim);
-        q.wait();
 
         q.memcpy(output.data(), last_layer->get_output_ptr(),
                  output_dim * sizeof(T))
@@ -1121,10 +885,6 @@ inline void add_fc_bias_bnorm_relu_block(Network<T> &net, dnnl::engine &engine,
     add_batchnorm_layer(net, engine, stream, file_directory + bn_scale_file,
             file_directory + bn_bias_file, file_directory + bn_mean_file,
             file_directory + bn_var_file, batch, out_c, 1, 1);
-    /*
-    add_activation_layer(
-            net, handle, batch, out_c, 1, 1, ActivationMode::ACTIVATION_RELU);
-            */
 }
 
 void pointnet(dnnl::engine::kind engine_kind) {}
@@ -1269,7 +1029,6 @@ int main(int argc, char *argv[]) {
             data_dir + "transform.feature_transform.fc3.bias.bin", 32, 256,
             4096);
 
-    // TODO:: convert to sum
     add_sum_layer(feature_transform_block, eng, stream,
             data_dir + "transform.feature_transform.id.bin", 1, 32 * 4096, 1,
             1);
@@ -1313,13 +1072,6 @@ int main(int argc, char *argv[]) {
 
     auto output = feature_transform_block.get_output_as_host_vec();
 
-    /*
-    for (int i = 0; i < 32 * 10; ++i) {
-        std::cout << output[i] << ' ';
-    }
-    std::cout << '\n';
-    */
-
     // Find index of max value in each row of output, then calculate mode of
     // results to get final classification
     std::vector<int> predicted(32);
@@ -1327,17 +1079,8 @@ int main(int argc, char *argv[]) {
         auto maxVal = std::max_element(
                 output.begin() + (i * 10), output.begin() + (i * 10) + 10);
         predicted[i] = std::distance(output.begin() + (i * 10), maxVal);
-        //std::cout << "maxVal " << *maxVal << " predicted " << predicted[i]
-        //<< " for i=" << i << '\n';
     }
     std::sort(predicted.begin(), predicted.end());
-
-    /*
-    for (const auto &e : predicted) {
-        std::cout << e << ' ';
-    }
-    std::cout << '\n';
-    */
 
     int prev = predicted[0];
     int count = 1;
@@ -1362,7 +1105,7 @@ int main(int argc, char *argv[]) {
     std::cout << "classed as " << mode << " (i.e., " << object_map[mode] << ")"
               << std::endl;
 
-    /*
+#if CHECK_PERF
     int loops = 8;
     do {
         auto start = std::chrono::high_resolution_clock::now();
@@ -1375,7 +1118,7 @@ int main(int argc, char *argv[]) {
         auto end = std::chrono::high_resolution_clock::now();
         std::cout << (end - start).count() << " ns" << std::endl;
     } while (--loops);
-    */
+#endif
 
     sycl::free(in_ptr, sycl_queue);
 
